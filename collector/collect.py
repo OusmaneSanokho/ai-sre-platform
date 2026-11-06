@@ -3,10 +3,31 @@ import os
 from datetime import datetime, timezone
 
 from kubernetes import client, config
+from kubernetes.client.rest import ApiException
 
 NAMESPACE = "shop"
 OUTPUT_DIR = "evidence"
 OUTPUT_FILE = os.path.join(OUTPUT_DIR, "evidence.json")
+
+LOG_TAIL_LINES = 200
+ERROR_KEYWORDS = ("ERROR", "CRITICAL", "Traceback", "Exception")
+
+
+def collect_error_logs(core, pod_name):
+    try:
+        text = core.read_namespaced_pod_log(
+            name=pod_name,
+            namespace=NAMESPACE,
+            tail_lines=LOG_TAIL_LINES,
+        )
+    except ApiException as e:
+        return [f"could not read logs: {e.reason}"]
+
+    error_lines = []
+    for line in text.splitlines():
+        if any(word in line for word in ERROR_KEYWORDS):
+            error_lines.append(line)
+    return error_lines
 
 
 def collect_pods(core):
@@ -22,11 +43,13 @@ def collect_pods(core):
         pods.append({
             "name": pod.metadata.name,
             "app": (pod.metadata.labels or {}).get("app"),
+            "node": pod.spec.node_name,
             "phase": pod.status.phase,
             "ready": bool(containers) and all(c.ready for c in containers),
             "restarts": sum(c.restart_count for c in containers),
             "waiting_reasons": waiting_reasons,
             "created_at": pod.metadata.creation_timestamp.isoformat(),
+            "error_log_lines": collect_error_logs(core, pod.metadata.name),
         })
     return pods
 
@@ -102,11 +125,14 @@ def main():
     with open(OUTPUT_FILE, "w") as f:
         json.dump(evidence, f, indent=2)
 
+    error_lines = sum(len(p["error_log_lines"]) for p in evidence["pods"])
+
     print(f"Evidence saved to {OUTPUT_FILE}")
-    print(f"  pods:           {len(evidence['pods'])}")
-    print(f"  deployments:    {len(evidence['deployments'])}")
-    print(f"  services:       {len(evidence['services'])}")
-    print(f"  warning events: {len(evidence['warning_events'])}")
+    print(f"  pods:            {len(evidence['pods'])}")
+    print(f"  deployments:     {len(evidence['deployments'])}")
+    print(f"  services:        {len(evidence['services'])}")
+    print(f"  warning events:  {len(evidence['warning_events'])}")
+    print(f"  error log lines: {error_lines}")
 
 
 if __name__ == "__main__":
