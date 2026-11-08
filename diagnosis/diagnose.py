@@ -3,11 +3,11 @@ import os
 import re
 import textwrap
 from datetime import datetime, timezone
-
+ 
 EVIDENCE_DIR = "evidence"
 EVIDENCE_FILE = os.path.join(EVIDENCE_DIR, "evidence.json")
 DIAGNOSIS_FILE = os.path.join(EVIDENCE_DIR, "diagnosis.json")
-
+ 
 IMAGE_PULL_REASONS = {"ErrImagePull", "ImagePullBackOff"}
 AUTH_FAILURE_PATTERNS = (
     "password authentication failed",
@@ -15,26 +15,26 @@ AUTH_FAILURE_PATTERNS = (
     "access denied for user",
 )
 CRASH_RESTART_THRESHOLD = 3
-
-
+ 
+ 
 # ---------- helpers ----------
-
+ 
 def load_evidence(path):
     with open(path) as f:
         return json.load(f)
-
-
+ 
+ 
 def find_by_name(items, name):
     for item in items:
         if item["name"] == name:
             return item
     return None
-
-
+ 
+ 
 def fact(source, observed, meaning):
     return {"source": source, "observed": observed, "meaning": meaning}
-
-
+ 
+ 
 def rollout_impact(ev, app):
     dep = find_by_name(ev["deployments"], app)
     if dep and dep["desired_replicas"] > 0 and dep["ready_replicas"] >= dep["desired_replicas"]:
@@ -48,8 +48,8 @@ def rollout_impact(ev, app):
             f"Users are likely affected."
         )
     return f"{app} may be affected."
-
-
+ 
+ 
 def exit_code_meaning(code):
     meanings = {
         0: "The app exited normally, but Kubernetes expects it to keep running.",
@@ -59,43 +59,50 @@ def exit_code_meaning(code):
         143: "The app was asked to stop (SIGTERM).",
     }
     return meanings.get(code, "The app stopped with an error code.")
-
-
+ 
+ 
 def is_crashing(pod):
     return (
         "CrashLoopBackOff" in pod["waiting_reasons"]
         or pod["restarts"] >= CRASH_RESTART_THRESHOLD
     )
-
-
+ 
+ 
 def was_oom_killed(pod):
     return any(t["reason"] == "OOMKilled" for t in pod["terminations"])
-
-
+ 
+ 
+def find_auth_failure_line(pod):
+    for line in pod["error_log_lines"]:
+        if any(p in line.lower() for p in AUTH_FAILURE_PATTERNS):
+            return line.strip()
+    return None
+ 
+ 
 # ---------- rule 1: dependency scaled to zero ----------
-
+ 
 def rule_dependency_scaled_to_zero(ev):
     findings = []
     ns = ev["namespace"]
-
+ 
     for svc in ev["services"]:
         if svc["ready_endpoints"]:
             continue
-
+ 
         app = (svc["selector"] or {}).get("app")
         dep = find_by_name(ev["deployments"], app)
         if dep is None or dep["desired_replicas"] != 0:
             continue
-
+ 
         victims = []
         for pod in ev["pods"]:
             for line in pod["error_log_lines"]:
                 if svc["name"] in line:
                     victims.append((pod["name"], pod["app"], line.strip()))
                     break
-
+ 
         affected = sorted({victim_app for _, victim_app, _ in victims})
-
+ 
         evidence = [
             fact(
                 f"deployment/{dep['name']}",
@@ -115,7 +122,7 @@ def rule_dependency_scaled_to_zero(ev):
                 line,
                 f"{victim_app} tried to reach {svc['name']} and failed.",
             ))
-
+ 
         what_happened = (
             f"The Deployment '{dep['name']}' is set to run 0 copies. "
             f"Its Service '{svc['name']}' still exists, but nobody is behind it, "
@@ -139,7 +146,7 @@ def rule_dependency_scaled_to_zero(ev):
             confidence_reason = (
                 "The cause is clear, but no other pod has logged errors about it yet."
             )
-
+ 
         findings.append({
             "id": "dependency_scaled_to_zero",
             "title": f"{dep['name']} scaled to zero",
@@ -164,56 +171,92 @@ def rule_dependency_scaled_to_zero(ev):
                 "That would need the cluster audit log."
             ),
         })
-
+ 
     return findings
-
-
+ 
+ 
 # ---------- rule 2: database login rejected ----------
-
+ 
 def rule_database_auth_failure(ev):
     findings = []
     ns = ev["namespace"]
-
-    hits_by_app = {}
+ 
+    # Step 1: find every pod that logs a rejected login.
+    hits = []
     for pod in ev["pods"]:
-        for line in pod["error_log_lines"]:
-            if any(p in line.lower() for p in AUTH_FAILURE_PATTERNS):
-                hits_by_app.setdefault(pod["app"], []).append((pod["name"], line.strip()))
-                break
-
-    for app, hits in hits_by_app.items():
-        targets = []
-        for _, line in hits:
-            for svc in ev["services"]:
-                if svc["name"] != app and svc["name"] in line and svc not in targets:
-                    targets.append(svc)
-
-        db_name = targets[0]["name"] if targets else "the database"
-        db_up = bool(targets) and all(s["ready_endpoints"] for s in targets)
-
+        line = find_auth_failure_line(pod)
+        if line:
+            hits.append((pod, line))
+ 
+    # Step 2: split them in two sides.
+    # Client side: the line names another service ("I could not log in to postgres").
+    # Server side: the line names no other service ("I rejected a login").
+    clients = {}
+    server_side = []
+    for pod, line in hits:
+        targets = [
+            s for s in ev["services"]
+            if s["name"] != pod["app"] and s["name"] in line
+        ]
+        if targets:
+            entry = clients.setdefault(pod["app"], {"hits": [], "targets": []})
+            entry["hits"].append((pod["name"], line))
+            for t in targets:
+                if t not in entry["targets"]:
+                    entry["targets"].append(t)
+        else:
+            server_side.append((pod, line))
+ 
+    used_server_pods = set()
+ 
+    # Step 3: one finding per client app. Server-side lines from the
+    # database it talks to become confirmation, not a separate problem.
+    for app, entry in clients.items():
+        targets = entry["targets"]
+        target_apps = {(t["selector"] or {}).get("app") for t in targets}
+        db_name = targets[0]["name"]
+        db_up = all(t["ready_endpoints"] for t in targets)
+ 
         evidence = []
-        for pod_name, line in hits:
+        for pod_name, line in entry["hits"]:
             evidence.append(fact(
                 f"pod/{pod_name} logs",
                 line,
                 f"{app} reached the database, but the database rejected its login.",
             ))
-        for s in targets:
-            if s["ready_endpoints"]:
+ 
+        confirmed = False
+        for pod, line in server_side:
+            if pod["app"] in target_apps:
+                confirmed = True
+                used_server_pods.add(pod["name"])
                 evidence.append(fact(
-                    f"service/{s['name']}",
-                    f"{len(s['ready_endpoints'])} ready endpoint(s)",
+                    f"pod/{pod['name']} logs",
+                    line,
+                    "The database's own log confirms it rejected a login. "
+                    "This is the same problem seen from the other side.",
+                ))
+ 
+        for t in targets:
+            if t["ready_endpoints"]:
+                evidence.append(fact(
+                    f"service/{t['name']}",
+                    f"{len(t['ready_endpoints'])} ready endpoint(s)",
                     "The database is up and answering. It is not down, it is refusing the credentials.",
                 ))
             else:
                 evidence.append(fact(
-                    f"service/{s['name']}",
+                    f"service/{t['name']}",
                     "no ready endpoints",
                     "The database also has no ready pod, so there may be a second problem.",
                 ))
-
+ 
         dep = find_by_name(ev["deployments"], app)
-        app_ready = bool(dep) and dep["desired_replicas"] > 0 and dep["ready_replicas"] >= dep["desired_replicas"]
+        app_ready = (
+            bool(dep)
+            and dep["desired_replicas"] > 0
+            and dep["ready_replicas"] >= dep["desired_replicas"]
+        )
         if app_ready:
             evidence.append(fact(
                 f"deployment/{app}",
@@ -227,8 +270,14 @@ def rule_database_auth_failure(ev):
             )
         else:
             impact = f"Requests to {app} that need {db_name} fail."
-
-        if db_up:
+ 
+        if db_up and confirmed:
+            confidence = "high"
+            confidence_reason = (
+                f"{app} says its login failed, {db_name} says it rejected a login, "
+                f"and {db_name} is up. Both sides of the connection agree."
+            )
+        elif db_up:
             confidence = "high"
             confidence_reason = (
                 "The logs say the login failed, and the database itself is up, "
@@ -237,9 +286,10 @@ def rule_database_auth_failure(ev):
         else:
             confidence = "medium"
             confidence_reason = (
-                "The logs say the login failed, but the database state could not be confirmed."
+                "The logs say the login failed, but the database is not fully up, "
+                "so there may be more than one problem."
             )
-
+ 
         findings.append({
             "id": "database_auth_failure",
             "title": f"{app} cannot log in to {db_name}",
@@ -270,17 +320,58 @@ def rule_database_auth_failure(ev):
                 "password or the database user."
             ),
         })
-
+ 
+    # Step 4: server-side rejections that no client explains.
+    leftover_by_app = {}
+    for pod, line in server_side:
+        if pod["name"] not in used_server_pods:
+            leftover_by_app.setdefault(pod["app"], []).append((pod["name"], line))
+ 
+    for app, lines in leftover_by_app.items():
+        evidence = []
+        for pod_name, line in lines:
+            evidence.append(fact(
+                f"pod/{pod_name} logs",
+                line,
+                f"{app} rejected a login attempt.",
+            ))
+ 
+        findings.append({
+            "id": "logins_rejected",
+            "title": f"{app} is rejecting logins",
+            "summary": f"Something is trying to log in to {app} with wrong credentials.",
+            "what_happened": (
+                f"{app} logged that it refused a login. No app in this namespace "
+                f"reports the failure from its side, so the caller is unknown. It could "
+                f"be an app in another namespace, a manual login attempt, or an old error."
+            ),
+            "root_cause": f"Unknown client using wrong credentials for {app}.",
+            "impact": "unknown: no affected app found",
+            "confidence": "low",
+            "confidence_reason": (
+                "Only one side of the connection is visible. The tool cannot tell who "
+                "tried to log in."
+            ),
+            "evidence": evidence,
+            "fix": {
+                "command": f"look at the full logs: kubectl logs -n {ns} deploy/{app} --tail=50",
+                "verify": "check if the rejected logins continue",
+            },
+            "limits": (
+                "The tool only looks at one namespace. The client may be somewhere it cannot see."
+            ),
+        })
+ 
     return findings
-
-
+ 
+ 
 # ---------- rule 3: image pull failure ----------
-
+ 
 def classify_pull_error(text):
     t = text.lower()
     missing = "not found" in t or "does not exist" in t
     auth = "unauthorized" in t or "authorization" in t or "denied" in t
-
+ 
     if missing and auth:
         return (
             "the image does not exist, or it is private and the cluster has no access",
@@ -306,23 +397,23 @@ def classify_pull_error(text):
         "low",
         "The error message does not say why. Check the image name, the tag and the network.",
     )
-
-
+ 
+ 
 def rule_image_pull_failure(ev):
     findings = []
     ns = ev["namespace"]
-
+ 
     failing_by_app = {}
     for pod in ev["pods"]:
         reasons = IMAGE_PULL_REASONS.intersection(pod["waiting_reasons"])
         if reasons:
             failing_by_app.setdefault(pod["app"], []).append((pod, reasons))
-
+ 
     for app, failing in failing_by_app.items():
         evidence = []
         messages = []
         image = None
-
+ 
         for pod, reasons in failing:
             evidence.append(fact(
                 f"pod/{pod['name']}",
@@ -343,14 +434,14 @@ def rule_image_pull_failure(ev):
                 match = re.search(r'image "([^"]+)"', e["message"])
                 if match and image is None:
                     image = match.group(1)
-
+ 
         cause, confidence, confidence_reason = classify_pull_error(" ".join(messages))
         if not messages:
             confidence = "medium"
             confidence_reason = "The pod is stuck on the image, but no event explains why."
-
+ 
         image_text = f"'{image}'" if image else "the requested image"
-
+ 
         findings.append({
             "id": "image_pull_failure",
             "title": f"image pull failure in {app}",
@@ -377,25 +468,25 @@ def rule_image_pull_failure(ev):
                 "message the registry sent back."
             ),
         })
-
+ 
     return findings
-
-
+ 
+ 
 # ---------- rule 4: out of memory ----------
-
+ 
 def rule_out_of_memory(ev):
     findings = []
     ns = ev["namespace"]
-
+ 
     oom_by_app = {}
     for pod in ev["pods"]:
         if was_oom_killed(pod):
             oom_by_app.setdefault(pod["app"], []).append(pod)
-
+ 
     for app, pods in oom_by_app.items():
         evidence = []
         limits = set()
-
+ 
         for pod in pods:
             for t in pod["terminations"]:
                 if t["reason"] == "OOMKilled":
@@ -410,7 +501,7 @@ def rule_out_of_memory(ev):
                 "Kubernetes restarts it, and it gets killed again.",
             ))
             limits.update(pod["memory_limits"].values())
-
+ 
         if limits:
             limit_text = ", ".join(sorted(limits))
             evidence.append(fact(
@@ -420,7 +511,7 @@ def rule_out_of_memory(ev):
             ))
         else:
             limit_text = "its limit"
-
+ 
         findings.append({
             "id": "out_of_memory",
             "title": f"{app} runs out of memory",
@@ -447,25 +538,25 @@ def rule_out_of_memory(ev):
                 "really needs. Memory metrics (Prometheus, Phase 4) would show that."
             ),
         })
-
+ 
     return findings
-
-
+ 
+ 
 # ---------- rule 5: crash loop ----------
-
+ 
 def rule_crash_loop(ev):
     findings = []
     ns = ev["namespace"]
-
+ 
     crashing_by_app = {}
     for pod in ev["pods"]:
         if is_crashing(pod) and not was_oom_killed(pod):
             crashing_by_app.setdefault(pod["app"], []).append(pod)
-
+ 
     for app, pods in crashing_by_app.items():
         evidence = []
         crash_line = None
-
+ 
         for pod in pods:
             waiting = ", ".join(pod["waiting_reasons"]) or "none"
             evidence.append(fact(
@@ -480,7 +571,7 @@ def rule_crash_loop(ev):
                     f"reason {t['reason']}, exit code {t['exit_code']}",
                     exit_code_meaning(t["exit_code"]),
                 ))
-
+ 
             logs = pod["previous_error_log_lines"] or pod["error_log_lines"]
             for line in logs[-3:]:
                 evidence.append(fact(
@@ -494,7 +585,7 @@ def rule_crash_loop(ev):
                     if match:
                         crash_line = match.group(0).strip()
                         break
-
+ 
         if crash_line:
             cause = f"the app crashes at startup with: {crash_line}"
             confidence = "high"
@@ -503,14 +594,14 @@ def rule_crash_loop(ev):
             cause = "the app keeps exiting, but its logs do not show a clear error"
             confidence = "medium"
             confidence_reason = "The app is clearly crash-looping, but the logs do not name the error."
-
+ 
         what_happened = (
             f"Every time Kubernetes starts {app}, it stops again after a few seconds. "
             f"Kubernetes restarts it and waits a bit longer each time. This is called a crash loop."
         )
         if crash_line:
             what_happened += f" The last error printed was: {crash_line}."
-
+ 
         findings.append({
             "id": "crash_loop",
             "title": f"{app} is crash-looping",
@@ -534,10 +625,10 @@ def rule_crash_loop(ev):
                 "recent change caused it. Comparing the config with the previous version would help."
             ),
         })
-
+ 
     return findings
-
-
+ 
+ 
 RULES = [
     rule_dependency_scaled_to_zero,
     rule_database_auth_failure,
@@ -545,14 +636,14 @@ RULES = [
     rule_out_of_memory,
     rule_crash_loop,
 ]
-
-
+ 
+ 
 # ---------- report ----------
-
+ 
 def wrap(text, indent="  "):
     return textwrap.fill(text, width=80, initial_indent=indent, subsequent_indent=indent)
-
-
+ 
+ 
 def print_report(ev, findings):
     line = "=" * 60
     print(line)
@@ -561,14 +652,14 @@ def print_report(ev, findings):
     print(f"{len(findings)} problem(s) found")
     print(line)
     print()
-
+ 
     if not findings:
         print(wrap(
             "No known problem found. This only means none of the current rules "
             "matched. It does not prove the system is healthy."
         ))
         return
-
+ 
     for i, f in enumerate(findings, start=1):
         print(f"[{i}] {f['title'].upper()}")
         print(f"Confidence: {f['confidence']}")
@@ -597,8 +688,8 @@ def print_report(ev, findings):
         print()
         print("-" * 60)
         print()
-
-
+ 
+ 
 def save_diagnosis(ev, findings):
     diagnosis = {
         "diagnosed_at": datetime.now(timezone.utc).isoformat(),
@@ -608,19 +699,19 @@ def save_diagnosis(ev, findings):
     }
     with open(DIAGNOSIS_FILE, "w") as f:
         json.dump(diagnosis, f, indent=2)
-
-
+ 
+ 
 def main():
     ev = load_evidence(EVIDENCE_FILE)
-
+ 
     findings = []
     for rule in RULES:
         findings.extend(rule(ev))
-
+ 
     print_report(ev, findings)
     save_diagnosis(ev, findings)
     print(f"Diagnosis saved to {DIAGNOSIS_FILE}")
-
-
+ 
+ 
 if __name__ == "__main__":
     main()
