@@ -9,6 +9,12 @@ EVIDENCE_FILE = os.path.join(EVIDENCE_DIR, "evidence.json")
 DIAGNOSIS_FILE = os.path.join(EVIDENCE_DIR, "diagnosis.json")
 
 IMAGE_PULL_REASONS = {"ErrImagePull", "ImagePullBackOff"}
+AUTH_FAILURE_PATTERNS = (
+    "password authentication failed",
+    "authentication failed",
+    "access denied for user",
+)
+CRASH_RESTART_THRESHOLD = 3
 
 
 # ---------- helpers ----------
@@ -27,6 +33,43 @@ def find_by_name(items, name):
 
 def fact(source, observed, meaning):
     return {"source": source, "observed": observed, "meaning": meaning}
+
+
+def rollout_impact(ev, app):
+    dep = find_by_name(ev["deployments"], app)
+    if dep and dep["desired_replicas"] > 0 and dep["ready_replicas"] >= dep["desired_replicas"]:
+        return (
+            f"The broken pods are new ones. The previous version of {app} is still "
+            f"running, so users are probably not affected yet."
+        )
+    if dep:
+        return (
+            f"{app} has {dep['ready_replicas']} of {dep['desired_replicas']} copies ready. "
+            f"Users are likely affected."
+        )
+    return f"{app} may be affected."
+
+
+def exit_code_meaning(code):
+    meanings = {
+        0: "The app exited normally, but Kubernetes expects it to keep running.",
+        1: "The app stopped because of an error inside it.",
+        137: "The app was killed by the system, often because it used too much memory.",
+        139: "The app crashed hard (segmentation fault).",
+        143: "The app was asked to stop (SIGTERM).",
+    }
+    return meanings.get(code, "The app stopped with an error code.")
+
+
+def is_crashing(pod):
+    return (
+        "CrashLoopBackOff" in pod["waiting_reasons"]
+        or pod["restarts"] >= CRASH_RESTART_THRESHOLD
+    )
+
+
+def was_oom_killed(pod):
+    return any(t["reason"] == "OOMKilled" for t in pod["terminations"])
 
 
 # ---------- rule 1: dependency scaled to zero ----------
@@ -125,7 +168,113 @@ def rule_dependency_scaled_to_zero(ev):
     return findings
 
 
-# ---------- rule 2: image pull failure ----------
+# ---------- rule 2: database login rejected ----------
+
+def rule_database_auth_failure(ev):
+    findings = []
+    ns = ev["namespace"]
+
+    hits_by_app = {}
+    for pod in ev["pods"]:
+        for line in pod["error_log_lines"]:
+            if any(p in line.lower() for p in AUTH_FAILURE_PATTERNS):
+                hits_by_app.setdefault(pod["app"], []).append((pod["name"], line.strip()))
+                break
+
+    for app, hits in hits_by_app.items():
+        targets = []
+        for _, line in hits:
+            for svc in ev["services"]:
+                if svc["name"] != app and svc["name"] in line and svc not in targets:
+                    targets.append(svc)
+
+        db_name = targets[0]["name"] if targets else "the database"
+        db_up = bool(targets) and all(s["ready_endpoints"] for s in targets)
+
+        evidence = []
+        for pod_name, line in hits:
+            evidence.append(fact(
+                f"pod/{pod_name} logs",
+                line,
+                f"{app} reached the database, but the database rejected its login.",
+            ))
+        for s in targets:
+            if s["ready_endpoints"]:
+                evidence.append(fact(
+                    f"service/{s['name']}",
+                    f"{len(s['ready_endpoints'])} ready endpoint(s)",
+                    "The database is up and answering. It is not down, it is refusing the credentials.",
+                ))
+            else:
+                evidence.append(fact(
+                    f"service/{s['name']}",
+                    "no ready endpoints",
+                    "The database also has no ready pod, so there may be a second problem.",
+                ))
+
+        dep = find_by_name(ev["deployments"], app)
+        app_ready = bool(dep) and dep["desired_replicas"] > 0 and dep["ready_replicas"] >= dep["desired_replicas"]
+        if app_ready:
+            evidence.append(fact(
+                f"deployment/{app}",
+                f"desired {dep['desired_replicas']}, ready {dep['ready_replicas']}",
+                "Kubernetes thinks the app is healthy, because its readiness check "
+                "does not test the database login.",
+            ))
+            impact = (
+                f"Every request to {app} that needs {db_name} fails. Kubernetes still "
+                f"shows {app} as healthy, so this will not show up in pod status."
+            )
+        else:
+            impact = f"Requests to {app} that need {db_name} fail."
+
+        if db_up:
+            confidence = "high"
+            confidence_reason = (
+                "The logs say the login failed, and the database itself is up, "
+                "so the problem is the credentials, not the database."
+            )
+        else:
+            confidence = "medium"
+            confidence_reason = (
+                "The logs say the login failed, but the database state could not be confirmed."
+            )
+
+        findings.append({
+            "id": "database_auth_failure",
+            "title": f"{app} cannot log in to {db_name}",
+            "summary": (
+                f"{app} is using the wrong credentials for {db_name}, so every request "
+                f"that needs the database fails."
+            ),
+            "what_happened": (
+                f"{app} can reach {db_name}, but {db_name} refuses its username or password. "
+                f"Nothing is down: the network works and both sides are running. "
+                f"This often happens after a password change, or a deploy that changed the config."
+            ),
+            "root_cause": f"Wrong database credentials used by {app}.",
+            "impact": impact,
+            "confidence": confidence,
+            "confidence_reason": confidence_reason,
+            "evidence": evidence,
+            "fix": {
+                "command": (
+                    f"check the DB_PASSWORD (or Secret) used by {app}. If a recent deploy "
+                    f"changed it, roll back: kubectl rollout undo deployment/{app} -n {ns}"
+                ),
+                "verify": f"retry the failing request and check that {app} logs no more authentication errors",
+            },
+            "limits": (
+                "The tool cannot see the real password. It only sees that the database "
+                "rejected the login. It cannot tell which side is wrong: the app's "
+                "password or the database user."
+            ),
+        })
+
+    return findings
+
+
+# ---------- rule 3: image pull failure ----------
 
 def classify_pull_error(text):
     t = text.lower()
@@ -202,15 +351,6 @@ def rule_image_pull_failure(ev):
 
         image_text = f"'{image}'" if image else "the requested image"
 
-        dep = find_by_name(ev["deployments"], app)
-        if dep and dep["ready_replicas"] >= dep["desired_replicas"]:
-            impact = (
-                f"The new version of {app} cannot start. The old version is still "
-                f"running, so users are probably not affected yet."
-            )
-        else:
-            impact = f"{app} has fewer ready copies than wanted. Users may be affected."
-
         findings.append({
             "id": "image_pull_failure",
             "title": f"image pull failure in {app}",
@@ -221,7 +361,7 @@ def rule_image_pull_failure(ev):
                 f"Most likely cause: {cause}."
             ),
             "root_cause": f"Image {image_text} cannot be pulled: {cause}.",
-            "impact": impact,
+            "impact": rollout_impact(ev, app),
             "confidence": confidence,
             "confidence_reason": confidence_reason,
             "evidence": evidence,
@@ -241,9 +381,169 @@ def rule_image_pull_failure(ev):
     return findings
 
 
+# ---------- rule 4: out of memory ----------
+
+def rule_out_of_memory(ev):
+    findings = []
+    ns = ev["namespace"]
+
+    oom_by_app = {}
+    for pod in ev["pods"]:
+        if was_oom_killed(pod):
+            oom_by_app.setdefault(pod["app"], []).append(pod)
+
+    for app, pods in oom_by_app.items():
+        evidence = []
+        limits = set()
+
+        for pod in pods:
+            for t in pod["terminations"]:
+                if t["reason"] == "OOMKilled":
+                    evidence.append(fact(
+                        f"pod/{pod['name']} {t['when']} exit",
+                        f"reason OOMKilled, exit code {t['exit_code']}",
+                        "The system killed the container because it used more memory than allowed.",
+                    ))
+            evidence.append(fact(
+                f"pod/{pod['name']}",
+                f"restarts {pod['restarts']}",
+                "Kubernetes restarts it, and it gets killed again.",
+            ))
+            limits.update(pod["memory_limits"].values())
+
+        if limits:
+            limit_text = ", ".join(sorted(limits))
+            evidence.append(fact(
+                f"deployment/{app} config",
+                f"memory limit {limit_text}",
+                "This is the maximum memory each container may use.",
+            ))
+        else:
+            limit_text = "its limit"
+
+        findings.append({
+            "id": "out_of_memory",
+            "title": f"{app} runs out of memory",
+            "summary": f"{app} needs more memory than it is allowed, so the system keeps killing it.",
+            "what_happened": (
+                f"{app} is allowed {limit_text} of memory. When it goes over, the system "
+                f"kills it on the spot. Kubernetes restarts it, it goes over again, and "
+                f"gets killed again."
+            ),
+            "root_cause": f"Memory limit too low for {app} ({limit_text}).",
+            "impact": rollout_impact(ev, app),
+            "confidence": "high",
+            "confidence_reason": "Kubernetes recorded OOMKilled as the reason the container stopped.",
+            "evidence": evidence,
+            "fix": {
+                "command": (
+                    f"raise resources.limits.memory for {app} in k8s/{app}.yaml and run "
+                    f"kubectl apply -f k8s/, or roll back: kubectl rollout undo deployment/{app} -n {ns}"
+                ),
+                "verify": f"kubectl get pods -n {ns}  (restarts should stop increasing)",
+            },
+            "limits": (
+                "The tool sees the kill and the limit, not how much memory the app "
+                "really needs. Memory metrics (Prometheus, Phase 4) would show that."
+            ),
+        })
+
+    return findings
+
+
+# ---------- rule 5: crash loop ----------
+
+def rule_crash_loop(ev):
+    findings = []
+    ns = ev["namespace"]
+
+    crashing_by_app = {}
+    for pod in ev["pods"]:
+        if is_crashing(pod) and not was_oom_killed(pod):
+            crashing_by_app.setdefault(pod["app"], []).append(pod)
+
+    for app, pods in crashing_by_app.items():
+        evidence = []
+        crash_line = None
+
+        for pod in pods:
+            waiting = ", ".join(pod["waiting_reasons"]) or "none"
+            evidence.append(fact(
+                f"pod/{pod['name']}",
+                f"restarts {pod['restarts']}, waiting: {waiting}",
+                "The container keeps starting and stopping. Kubernetes waits longer "
+                "between each restart.",
+            ))
+            for t in pod["terminations"]:
+                evidence.append(fact(
+                    f"pod/{pod['name']} {t['when']} exit",
+                    f"reason {t['reason']}, exit code {t['exit_code']}",
+                    exit_code_meaning(t["exit_code"]),
+                ))
+
+            logs = pod["previous_error_log_lines"] or pod["error_log_lines"]
+            for line in logs[-3:]:
+                evidence.append(fact(
+                    f"pod/{pod['name']} logs before crash",
+                    line.strip(),
+                    "What the app printed just before it stopped.",
+                ))
+            if crash_line is None:
+                for line in reversed(logs):
+                    match = re.search(r"\w+(?:Error|Exception): .+", line)
+                    if match:
+                        crash_line = match.group(0).strip()
+                        break
+
+        if crash_line:
+            cause = f"the app crashes at startup with: {crash_line}"
+            confidence = "high"
+            confidence_reason = "The app is restarting over and over, and its logs show the error that stops it."
+        else:
+            cause = "the app keeps exiting, but its logs do not show a clear error"
+            confidence = "medium"
+            confidence_reason = "The app is clearly crash-looping, but the logs do not name the error."
+
+        what_happened = (
+            f"Every time Kubernetes starts {app}, it stops again after a few seconds. "
+            f"Kubernetes restarts it and waits a bit longer each time. This is called a crash loop."
+        )
+        if crash_line:
+            what_happened += f" The last error printed was: {crash_line}."
+
+        findings.append({
+            "id": "crash_loop",
+            "title": f"{app} is crash-looping",
+            "summary": f"{app} crashes right after starting, again and again.",
+            "what_happened": what_happened,
+            "root_cause": f"In {app}, {cause}.",
+            "impact": rollout_impact(ev, app),
+            "confidence": confidence,
+            "confidence_reason": confidence_reason,
+            "evidence": evidence,
+            "fix": {
+                "command": (
+                    f"read the error above. If it started after a recent change (config, "
+                    f"environment variable, new image), roll back: "
+                    f"kubectl rollout undo deployment/{app} -n {ns}"
+                ),
+                "verify": f"kubectl get pods -n {ns}  (status Running, restarts no longer increasing)",
+            },
+            "limits": (
+                "The tool shows the last error the app printed. It cannot tell which "
+                "recent change caused it. Comparing the config with the previous version would help."
+            ),
+        })
+
+    return findings
+
+
 RULES = [
     rule_dependency_scaled_to_zero,
+    rule_database_auth_failure,
     rule_image_pull_failure,
+    rule_out_of_memory,
+    rule_crash_loop,
 ]
 
 
