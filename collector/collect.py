@@ -10,19 +10,10 @@ OUTPUT_DIR = "evidence"
 OUTPUT_FILE = os.path.join(OUTPUT_DIR, "evidence.json")
 
 LOG_TAIL_LINES = 200
-ERROR_KEYWORDS = ("ERROR", "CRITICAL", "Traceback", "Exception")
+ERROR_KEYWORDS = ("ERROR", "CRITICAL", "FATAL", "Traceback", "Exception", "Error:")
 
 
-def collect_error_logs(core, pod_name):
-    try:
-        text = core.read_namespaced_pod_log(
-            name=pod_name,
-            namespace=NAMESPACE,
-            tail_lines=LOG_TAIL_LINES,
-        )
-    except ApiException as e:
-        return [f"could not read logs: {e.reason}"]
-
+def filter_error_lines(text):
     error_lines = []
     for line in text.splitlines():
         if any(word in line for word in ERROR_KEYWORDS):
@@ -30,9 +21,47 @@ def collect_error_logs(core, pod_name):
     return error_lines
 
 
+def collect_error_logs(core, pod_name, previous=False):
+    try:
+        text = core.read_namespaced_pod_log(
+            name=pod_name,
+            namespace=NAMESPACE,
+            tail_lines=LOG_TAIL_LINES,
+            previous=previous,
+        )
+    except ApiException as e:
+        if previous:
+            return []
+        return [f"could not read logs: {e.reason}"]
+    return filter_error_lines(text)
+
+
+def collect_terminations(containers):
+    terminations = []
+    for c in containers:
+        for when, state in (("current", c.state), ("last", c.last_state)):
+            if state and state.terminated:
+                terminations.append({
+                    "container": c.name,
+                    "when": when,
+                    "reason": state.terminated.reason,
+                    "exit_code": state.terminated.exit_code,
+                })
+    return terminations
+
+
+def collect_memory_limits(pod):
+    limits = {}
+    for c in pod.spec.containers:
+        if c.resources and c.resources.limits and "memory" in c.resources.limits:
+            limits[c.name] = c.resources.limits["memory"]
+    return limits
+
+
 def collect_pods(core):
     pods = []
     for pod in core.list_namespaced_pod(NAMESPACE).items:
+        name = pod.metadata.name
         containers = pod.status.container_statuses or []
 
         waiting_reasons = []
@@ -40,16 +69,23 @@ def collect_pods(core):
             if c.state and c.state.waiting:
                 waiting_reasons.append(c.state.waiting.reason)
 
+        restarts = sum(c.restart_count for c in containers)
+
         pods.append({
-            "name": pod.metadata.name,
+            "name": name,
             "app": (pod.metadata.labels or {}).get("app"),
             "node": pod.spec.node_name,
             "phase": pod.status.phase,
             "ready": bool(containers) and all(c.ready for c in containers),
-            "restarts": sum(c.restart_count for c in containers),
+            "restarts": restarts,
             "waiting_reasons": waiting_reasons,
+            "terminations": collect_terminations(containers),
+            "memory_limits": collect_memory_limits(pod),
             "created_at": pod.metadata.creation_timestamp.isoformat(),
-            "error_log_lines": collect_error_logs(core, pod.metadata.name),
+            "error_log_lines": collect_error_logs(core, name),
+            "previous_error_log_lines": (
+                collect_error_logs(core, name, previous=True) if restarts > 0 else []
+            ),
         })
     return pods
 
@@ -125,14 +161,19 @@ def main():
     with open(OUTPUT_FILE, "w") as f:
         json.dump(evidence, f, indent=2)
 
-    error_lines = sum(len(p["error_log_lines"]) for p in evidence["pods"])
+    pods = evidence["pods"]
+    error_lines = sum(len(p["error_log_lines"]) for p in pods)
+    previous_lines = sum(len(p["previous_error_log_lines"]) for p in pods)
+    restarts = sum(p["restarts"] for p in pods)
 
     print(f"Evidence saved to {OUTPUT_FILE}")
-    print(f"  pods:            {len(evidence['pods'])}")
-    print(f"  deployments:     {len(evidence['deployments'])}")
-    print(f"  services:        {len(evidence['services'])}")
-    print(f"  warning events:  {len(evidence['warning_events'])}")
-    print(f"  error log lines: {error_lines}")
+    print(f"  pods:                     {len(pods)}")
+    print(f"  deployments:              {len(evidence['deployments'])}")
+    print(f"  services:                 {len(evidence['services'])}")
+    print(f"  warning events:           {len(evidence['warning_events'])}")
+    print(f"  total restarts:           {restarts}")
+    print(f"  error log lines:          {error_lines}")
+    print(f"  error lines before crash: {previous_lines}")
 
 
 if __name__ == "__main__":

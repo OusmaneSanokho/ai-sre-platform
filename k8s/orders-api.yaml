@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
         - name: orders-api
-          image: orders-api:v1
+          image: orders-api:v2
           imagePullPolicy: IfNotPresent
           env:
             - name: DB_HOST
