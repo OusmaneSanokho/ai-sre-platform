@@ -22,7 +22,7 @@ spec:
           args:
             - |
               while true; do
-                code=$(curl -s -o /dev/null -w "%{http_code}" http://orders-api/orders)
-                echo "GET /orders -> $code"
+                code=$(curl -s -o /dev/null --max-time 5 -w "%{http_code}" http://orders-api/orders)
+                echo "$(date -u +%H:%M:%S) GET /orders -> $code"
                 sleep 2
               done
