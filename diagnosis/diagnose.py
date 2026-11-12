@@ -701,13 +701,17 @@ def save_diagnosis(ev, findings):
         json.dump(diagnosis, f, indent=2)
  
  
-def main():
-    ev = load_evidence(EVIDENCE_FILE)
- 
+def diagnose(ev):
+    """Run every rule on the evidence and return the list of findings."""
     findings = []
     for rule in RULES:
         findings.extend(rule(ev))
+    return findings
  
+ 
+def main():
+    ev = load_evidence(EVIDENCE_FILE)
+    findings = diagnose(ev)
     print_report(ev, findings)
     save_diagnosis(ev, findings)
     print(f"Diagnosis saved to {DIAGNOSIS_FILE}")
@@ -715,3 +719,4 @@ def main():
  
 if __name__ == "__main__":
     main()
+
