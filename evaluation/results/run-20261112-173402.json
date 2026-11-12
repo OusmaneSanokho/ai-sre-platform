@@ -1,0 +1,17 @@
+{
+  "started_at": "2026-11-12T17:34:02.913864+00:00",
+  "results": [
+    {
+      "scenario": "db_scaled_to_zero",
+      "title": "database turned off",
+      "run": 1,
+      "expected": "dependency_scaled_to_zero",
+      "status": "correct",
+      "judge_answer": [
+        "postgres scaled to zero"
+      ],
+      "confidence": "high",
+      "seconds_to_diagnose": 10
+    }
+  ]
+}

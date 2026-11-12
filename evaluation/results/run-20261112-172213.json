@@ -1,0 +1,16 @@
+{
+  "started_at": "2026-11-12T17:22:13.959328+00:00",
+  "results": [
+    {
+      "scenario": "db_scaled_to_zero",
+      "run": 1,
+      "expected": "dependency_scaled_to_zero",
+      "status": "correct",
+      "found": [
+        "dependency_scaled_to_zero"
+      ],
+      "confidence": "high",
+      "seconds_to_diagnose": 10
+    }
+  ]
+}
