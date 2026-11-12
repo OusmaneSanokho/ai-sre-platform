@@ -1,5 +1,6 @@
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
@@ -13,6 +14,7 @@ from evaluation.scenarios import EXPECTED_CONTEXT, NAMESPACE, SCENARIOS
 POLL_SECONDS = 10          # how often we ask the judge while waiting
 DETECT_TIMEOUT = 150       # give up on a scenario after this many seconds
 HEALTHY_CHECK_DELAY = 20   # healthy scenario: wait this long, then ask once
+COOL_DOWN_SECONDS = 15     # pause between "healthy again" and the next break
 CLEAN_TIMEOUT = 240        # max wait for the cluster to be healthy again
 RESULTS_DIR = os.path.join("evaluation", "results")
 
@@ -106,7 +108,7 @@ def wait_until_clean():
 
 def ask_judge(start):
     """Collect evidence from the start of this scenario only, then diagnose."""
-    since = int(time.time() - start) + 5
+    since = max(1, math.ceil(time.time() - start))
     ev = collect_evidence(NAMESPACE, since_seconds=since)
     return diagnose(ev)
 
@@ -126,6 +128,10 @@ def run_scenario(scenario, run_number):
 
     say("  Checking the cluster is healthy... ", end="")
     wait_until_clean()
+    say("ok")
+
+    say(f"  Waiting {COOL_DOWN_SECONDS} s so the previous scenario is fully over... ", end="")
+    time.sleep(COOL_DOWN_SECONDS)
     say("ok")
 
     say("  Breaking it... ", end="")
